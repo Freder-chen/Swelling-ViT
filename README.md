@@ -1,3 +1,4 @@
 # ViT-P PyTorch implementation
 
-Paper will coming soon.
+The paper will come soon.
+

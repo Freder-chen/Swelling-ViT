@@ -1,2 +1,3 @@
-# vitp
-PyTorch implementation of ViT-P
+# ViT-P PyTorch implementation
+
+Paper will coming soon.

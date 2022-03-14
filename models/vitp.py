@@ -5,14 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 # --------------------------------------------------------
 # References:
-# timm: https://github.com/rwightman/pytorch-image-models/tree/master/timm
+# timm: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
 # --------------------------------------------------------
 
 import math
 import logging
 from functools import partial
 from collections import OrderedDict
-from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -25,6 +24,9 @@ from timm.models.vision_transformer import (
 )
 
 from util.pos_embed import get_2d_sincos_pos_embed
+
+
+__all__ = ['vitp_tiny_patch2_32', 'vitp_small_patch2_32', 'vitp_base_patch2_32', 'vitp_tiny_patch16_224', 'vitp_small_patch16_224', 'vitp_base_patch16_224']
 
 
 _logger = logging.getLogger(__name__)
@@ -49,65 +51,51 @@ default_cfgs = {
     'vitp_tiny_patch2_32': _cfg(url='', input_size=(3, 32, 32)),
     'vitp_small_patch2_32': _cfg(url='', input_size=(3, 32, 32)),
     'vitp_base_patch2_32': _cfg(url='', input_size=(3, 32, 32)),
-    'vitp_large_patch2_32': _cfg(url='', input_size=(3, 32, 32)),
 
-    'vitp_tiny_patch16_224': _cfg(
-        url='https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth'
-    ),
-    'vitp_small_patch16_224': _cfg(
-        url='https://dl.fbaipublicfiles.com/deit/deit_small_patch16_224-cd65a155.pth'
-    ),
-    'vitp_base_patch16_224': _cfg(
-        url='https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth'
-    ),
-    'vitp_large_patch16_224': _cfg(url='')
+    'vitp_tiny_patch16_224': _cfg(url=''),
+    'vitp_small_patch16_224': _cfg(url=''),
+    'vitp_base_patch16_224': _cfg(url='')
 }
 
 
-class AttentionWithRelativePosition(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., att_distance=0, inhibition_num=0, num_patches=196):
+class MiltiFocalAttention(nn.Module):
+    def __init__(self, dim, num_heads=12, qkv_bias=False, attn_drop=0., proj_drop=0.,
+            attn_distances=[], suppression_value=0, num_patches=196, num_tokens=0):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
-        if isinstance(att_distance, int):
-            att_distance = [att_distance] * num_heads
-        elif isinstance(att_distance, list) and len(att_distance) == num_heads:
-            pass
-        else:
-            raise ValueError('attention_distance type illegal. {}'.format(att_distance))
+        assert len(attn_distances) == num_heads, 'attention_distance value illegal. {}'.format(attn_distances)
 
-        has_cls = True
+        table_size = (2 * int(math.sqrt(num_patches)) - 1) ** 2 + (1 if num_tokens > 0 else 0)  # (2 * h - 1) * (2 * w - 1) + 0/1
 
-        table_size = (2 * int(math.sqrt(num_patches)) - 1) ** 2 + (1 if has_cls else 0)  # (2 * h - 1) * (2 * w - 1) + 0/1
+        # define a parameter table of relative attention bias
+        relative_attention_bias_table = torch.zeros(table_size, num_heads)
+        trunc_normal_(relative_attention_bias_table, std=.02)
+        for i in range(relative_attention_bias_table.size(1)):
+            suppression_index = self.cal_suppression_index(attn_distances[i], num_patches, num_tokens)
+            relative_attention_bias_table[suppression_index, i] += suppression_value
+        self.relative_attention_bias_table = nn.Parameter(relative_attention_bias_table)
+        attention_bias_index = self.generate_attention_bias_index(num_patches, num_tokens)
+        self.register_buffer('attention_bias_index', attention_bias_index)
 
-        # make torch happy        
-        relative_distance_table = torch.zeros(table_size, num_heads)
-        trunc_normal_(relative_distance_table, std=.02)
-        for i in range(relative_distance_table.size(1)):
-            inhibition_index = self.cal_inhibition_index(att_distance[i], num_patches, has_cls)
-            relative_distance_table[inhibition_index, i] += inhibition_num
-        self.register_parameter('relative_distance_table', nn.Parameter(relative_distance_table))
-        
-        relative_distance_index = self.generate_relative_distance_index(num_patches, has_cls=has_cls)
-        self.register_buffer('relative_distance_index', relative_distance_index)
-
+        # define qkv and proj
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-    
+
     def forward(self, x):
         B, N, C = x.shape
 
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
     
-        relative_position_bias = self.relative_distance_table[self.relative_distance_index.view(-1)].view(N, N, -1)  # h*w,h*w,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, h*w, h*w
+        attention_bias = self.relative_attention_bias_table[self.attention_bias_index.view(-1)].view(N, N, -1)  # h*w,h*w,nH
+        attention_bias = attention_bias.permute(2, 0, 1).contiguous()  # nH, h*w, h*w
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale + relative_position_bias
+        attn = (q @ k.transpose(-2, -1)) * self.scale + attention_bias
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -117,7 +105,7 @@ class AttentionWithRelativePosition(nn.Module):
         return x
     
     @staticmethod
-    def generate_relative_distance_index(num_patches, has_cls=True):
+    def generate_attention_bias_index(num_patches, num_tokens=0):
         size = int(math.sqrt(num_patches))
         coords_h, coords_w = torch.arange(size), torch.arange(size)
         coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, h, w
@@ -127,102 +115,42 @@ class AttentionWithRelativePosition(nn.Module):
         relative_coords[:, :, 0] += size - 1  # shift to start from 0
         relative_coords[:, :, 1] += size - 1
         relative_coords[:, :, 0] *= 2 * size - 1
-        relative_distance_index = relative_coords.sum(-1)  # h*w, h*w
-        if has_cls:
-            relative_distance_index += 1
-            temp = torch.zeros(num_patches + 1, num_patches + 1)
-            temp[1:, 1:] = relative_distance_index
-            relative_distance_index = temp
-        return relative_distance_index.long()
+        attention_bias_index = relative_coords.sum(-1)  # h*w, h*w
+        
+        if num_tokens > 0:
+            attention_bias_index += 1  # All non-image domains are represented by index 0
+            temp = torch.zeros(num_patches + num_tokens, num_patches + num_tokens)
+            temp[num_tokens:, num_tokens:] = attention_bias_index
+            attention_bias_index = temp
+        
+        return attention_bias_index.long()
     
     @staticmethod
-    def cal_inhibition_index(att_distance, num_patches, has_cls=True):
+    def cal_suppression_index(attn_distance, num_patches, num_tokens=0):
         size = 2 * int(math.sqrt(num_patches)) - 1
         coords_h, coords_w = torch.arange(size), torch.arange(size)
         coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, h, w
         coords = coords.permute(1, 2, 0).contiguous()  # h, w, 2
 
+        # TODO: complexity optimization
         ret = []
         for r in range(coords.size(0)):
             for c in range(coords.size(1)):
-                if torch.maximum(torch.abs(coords[r][c][0] - size // 2), torch.abs(coords[r][c][1] - size // 2)) > att_distance:
-                    ret.append(r * size + c + (1 if has_cls else 0))
+                if torch.maximum(torch.abs(coords[r][c][0] - size // 2), torch.abs(coords[r][c][1] - size // 2)) > attn_distance:
+                    ret.append(r * size + c + (1 if num_tokens > 0 else 0))
+
         return torch.Tensor(ret).long()
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=12, qkv_bias=False, attn_drop=0., proj_drop=0., att_distance=0, inhibition_num=0, num_patches=196, learn_p=True):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-
-        if isinstance(att_distance, int):
-            att_distance = [att_distance] * num_heads
-        elif isinstance(att_distance, list) and len(att_distance) == num_heads:
-            pass
-        else:
-            raise ValueError('attention_distance type illegal. {}'.format(att_distance))
-
-        attn_mask = self.generate_mask(num_patches, att_distance, inhibition_num, has_cls=True)
-        if learn_p:
-            attn_mask = attn_mask + trunc_normal_(torch.zeros_like(attn_mask), std=.02)
-            self.register_parameter('attn_mask', nn.Parameter(attn_mask))
-        else:
-            self.register_buffer('attn_mask', attn_mask)
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale + self.attn_mask
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-    @staticmethod
-    def generate_mask(num_patches, att_distance, inhibition_num, has_cls=True):
-        def _distance(row, col, dis):
-            _map = torch.zeros(size, size)
-            if dis > 0:
-                _map += 1 # float('-inf')
-                for i in range(size):
-                    for j in range(size):
-                        if abs(row - i) <= dis and abs(col - j) <= dis:
-                            _map[i, j] = 0.
-            return _map.flatten()
-
-        mh_mask = []
-        for ad in att_distance:
-            size = int(math.sqrt(num_patches))
-            mask = torch.stack([_distance(i, j, int(ad)) for i in range(size) for j in range(size)])
-            if has_cls:
-                temp = torch.zeros(num_patches + 1, num_patches + 1)
-                temp[1:, 1:] = mask
-                mask = temp
-                mh_mask.append(mask)
-        mask = torch.stack(mh_mask) * inhibition_num
-        return mask.contiguous()
-
-
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 att_distance=0, inhibition_num=0, num_patches=196):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm, attn_distances=[], suppression_value=0, num_patches=196, num_tokens=0):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = AttentionWithRelativePosition(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, att_distance=att_distance, inhibition_num=inhibition_num, num_patches=num_patches)
-        # self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, att_distance=att_distance, inhibition_num=inhibition_num, num_patches=num_patches)
+        self.attn = MiltiFocalAttention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, 
+            attn_distances=attn_distances, suppression_value=suppression_value, num_patches=num_patches, num_tokens=num_tokens
+        )
         
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -240,12 +168,14 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., representation_size=None, embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', global_pool=False, attention_distance=None):
+                 act_layer=None, weight_init='', global_pool=False, attention_distances=[], suppression_value=-100,
+                 attention_bias_decay_scale=1):
         super().__init__()
         self.global_pool = global_pool
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.num_tokens = 1
+        self.attention_bias_decay_scale = attention_bias_decay_scale
         
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
@@ -256,18 +186,15 @@ class VisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim), requires_grad=False)
         self.pos_drop = nn.Dropout(p=drop_rate)
-        
-        # from math import log
-        # inhibition_nums = [log((i + 0.0001) / (depth - 1)) * 3 for i in range(12)]
-        inhibition_nums = [-100 for i in range(depth)]
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.Sequential(*[
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                att_distance=attention_distance[i], inhibition_num=inhibition_nums[i], num_patches=num_patches
+                attn_distances=attention_distances[i], suppression_value=suppression_value, num_patches=num_patches, num_tokens=self.num_tokens
             )
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
@@ -291,7 +218,6 @@ class VisionTransformer(nn.Module):
         assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
 
-        # different with origin ViT, code from mae.
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.patch_embed.num_patches**.5), cls_token=True)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
@@ -306,13 +232,23 @@ class VisionTransformer(nn.Module):
         # this fn left here for compat with downstream users
         _init_vit_weights(m)
 
-    @torch.jit.ignore()
-    def load_pretrained(self, checkpoint_path, prefix=''):
-        _load_weights(self, checkpoint_path, prefix)
+    # @torch.jit.ignore
+    # def load_pretrained(self, checkpoint_path, prefix=''):
+    #     _load_weights(self, checkpoint_path, prefix)
 
     @torch.jit.ignore
     def no_weight_decay(self):
-        return {'pos_embed', 'cls_token'}
+        return {
+            'pos_embed', 'cls_token',
+            # Using the following line makes it hard to activate the inhibited attention.
+            # *{f'blocks.{i}.attn.relative_attention_bias_table' for i in range(len(self.blocks))},
+        }
+    
+    @torch.jit.ignore
+    def decay_scale(self):
+        return {
+            f'blocks.{i}.attn.relative_attention_bias_table': self.attention_bias_decay_scale for i in range(len(self.blocks))
+        }
 
     def get_classifier(self):
         return self.head
@@ -331,8 +267,9 @@ class VisionTransformer(nn.Module):
         
         x = self.blocks(x)
 
-        x = x.mean(dim=1) if self.global_pool else x[:, 0]
         x = self.norm(x)
+
+        x = x.mean(dim=1) if self.global_pool else x[:, 0]
         
         return self.pre_logits(x)
 
@@ -340,7 +277,6 @@ class VisionTransformer(nn.Module):
         x = self.forward_features(x)
         x = self.head(x)
         return x
-
 
 def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):
     if isinstance(module, nn.Linear):
@@ -370,86 +306,6 @@ def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., 
     elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
         nn.init.zeros_(module.bias)
         nn.init.ones_(module.weight)
-
-
-@torch.no_grad()
-def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = ''):
-    """ Load weights from .npz checkpoints for official Google Brain Flax implementation
-    """
-    import numpy as np
-
-    def _n2p(w, t=True):
-        if w.ndim == 4 and w.shape[0] == w.shape[1] == w.shape[2] == 1:
-            w = w.flatten()
-        if t:
-            if w.ndim == 4:
-                w = w.transpose([3, 2, 0, 1])
-            elif w.ndim == 3:
-                w = w.transpose([2, 0, 1])
-            elif w.ndim == 2:
-                w = w.transpose([1, 0])
-        return torch.from_numpy(w)
-
-    w = np.load(checkpoint_path)
-    if not prefix and 'opt/target/embedding/kernel' in w:
-        prefix = 'opt/target/'
-
-    if hasattr(model.patch_embed, 'backbone'):
-        # hybrid
-        backbone = model.patch_embed.backbone
-        stem_only = not hasattr(backbone, 'stem')
-        stem = backbone if stem_only else backbone.stem
-        stem.conv.weight.copy_(adapt_input_conv(stem.conv.weight.shape[1], _n2p(w[f'{prefix}conv_root/kernel'])))
-        stem.norm.weight.copy_(_n2p(w[f'{prefix}gn_root/scale']))
-        stem.norm.bias.copy_(_n2p(w[f'{prefix}gn_root/bias']))
-        if not stem_only:
-            for i, stage in enumerate(backbone.stages):
-                for j, block in enumerate(stage.blocks):
-                    bp = f'{prefix}block{i + 1}/unit{j + 1}/'
-                    for r in range(3):
-                        getattr(block, f'conv{r + 1}').weight.copy_(_n2p(w[f'{bp}conv{r + 1}/kernel']))
-                        getattr(block, f'norm{r + 1}').weight.copy_(_n2p(w[f'{bp}gn{r + 1}/scale']))
-                        getattr(block, f'norm{r + 1}').bias.copy_(_n2p(w[f'{bp}gn{r + 1}/bias']))
-                    if block.downsample is not None:
-                        block.downsample.conv.weight.copy_(_n2p(w[f'{bp}conv_proj/kernel']))
-                        block.downsample.norm.weight.copy_(_n2p(w[f'{bp}gn_proj/scale']))
-                        block.downsample.norm.bias.copy_(_n2p(w[f'{bp}gn_proj/bias']))
-        embed_conv_w = _n2p(w[f'{prefix}embedding/kernel'])
-    else:
-        embed_conv_w = adapt_input_conv(
-            model.patch_embed.proj.weight.shape[1], _n2p(w[f'{prefix}embedding/kernel']))
-    model.patch_embed.proj.weight.copy_(embed_conv_w)
-    model.patch_embed.proj.bias.copy_(_n2p(w[f'{prefix}embedding/bias']))
-    model.cls_token.copy_(_n2p(w[f'{prefix}cls'], t=False))
-    pos_embed_w = _n2p(w[f'{prefix}Transformer/posembed_input/pos_embedding'], t=False)
-    if pos_embed_w.shape != model.pos_embed.shape:
-        pos_embed_w = resize_pos_embed(  # resize pos embedding when different size from pretrained weights
-            pos_embed_w, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
-    model.pos_embed.copy_(pos_embed_w)
-    model.norm.weight.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/scale']))
-    model.norm.bias.copy_(_n2p(w[f'{prefix}Transformer/encoder_norm/bias']))
-    if isinstance(model.head, nn.Linear) and model.head.bias.shape[0] == w[f'{prefix}head/bias'].shape[-1]:
-        model.head.weight.copy_(_n2p(w[f'{prefix}head/kernel']))
-        model.head.bias.copy_(_n2p(w[f'{prefix}head/bias']))
-    if isinstance(getattr(model.pre_logits, 'fc', None), nn.Linear) and f'{prefix}pre_logits/bias' in w:
-        model.pre_logits.fc.weight.copy_(_n2p(w[f'{prefix}pre_logits/kernel']))
-        model.pre_logits.fc.bias.copy_(_n2p(w[f'{prefix}pre_logits/bias']))
-    for i, block in enumerate(model.blocks.children()):
-        block_prefix = f'{prefix}Transformer/encoderblock_{i}/'
-        mha_prefix = block_prefix + 'MultiHeadDotProductAttention_1/'
-        block.norm1.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/scale']))
-        block.norm1.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_0/bias']))
-        block.attn.qkv.weight.copy_(torch.cat([
-            _n2p(w[f'{mha_prefix}{n}/kernel'], t=False).flatten(1).T for n in ('query', 'key', 'value')]))
-        block.attn.qkv.bias.copy_(torch.cat([
-            _n2p(w[f'{mha_prefix}{n}/bias'], t=False).reshape(-1) for n in ('query', 'key', 'value')]))
-        block.attn.proj.weight.copy_(_n2p(w[f'{mha_prefix}out/kernel']).flatten(1))
-        block.attn.proj.bias.copy_(_n2p(w[f'{mha_prefix}out/bias']))
-        for r in range(2):
-            getattr(block.mlp, f'fc{r + 1}').weight.copy_(_n2p(w[f'{block_prefix}MlpBlock_3/Dense_{r}/kernel']))
-            getattr(block.mlp, f'fc{r + 1}').bias.copy_(_n2p(w[f'{block_prefix}MlpBlock_3/Dense_{r}/bias']))
-        block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/scale']))
-        block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/bias']))
 
 
 def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
@@ -519,59 +375,66 @@ def _create_vision_transformer(variant, pretrained=False, default_cfg=None, **kw
     return model
 
 
+######## CIFAR MODEL START ########
+
 def vitp_tiny_patch2_32(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 3, 15 / 3)] * 12
-    model_kwargs = dict(patch_size=2, embed_dim=96, depth=12, num_heads=3, attention_distance=attention_distance, **kwargs)
+    # step = ((patch_num - 1) - 1) / (head_num - 1)
+    attention_distances = [generate_list(1, 3, 14 / 2)] * 12
+    model_kwargs = dict(patch_size=2, embed_dim=192, depth=12, num_heads=3, attention_distances=attention_distances, **kwargs)
     model = _create_vision_transformer('vitp_tiny_patch2_32', pretrained=pretrained, **model_kwargs)
     return model
 
 
 def vitp_small_patch2_32(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 6, 15 / 6)] * 12
-    model_kwargs = dict(patch_size=16, embed_dim=192, depth=12, num_heads=6, attention_distance=attention_distance, **kwargs)
+    attention_distances = [generate_list(1, 6, 14 / 5)] * 12
+    model_kwargs = dict(patch_size=2, embed_dim=384, depth=12, num_heads=6, attention_distances=attention_distances, **kwargs)
     model = _create_vision_transformer('vitp_small_patch2_32', pretrained=pretrained, **model_kwargs)
     return model
 
 
 def vitp_base_patch2_32(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 12, 15 / 12)] * 12
-    model_kwargs = dict(patch_size=2, embed_dim=384, depth=12, num_heads=12, attention_distance=attention_distance, **kwargs)
+    # If you want to downsize the model, reducing the embed_dim in half has little effect on accuracy.
+    # This means setting head_dim to 32. The rule applies to all models here.
+    
+    # attention_distances = [generate_list(i, 12, (15 - i) / 11) for i in generate_list(1, 12, 14 / 11)] # MRFA-DW
+    # attention_distances = [generate_list(i, 12, 0) for i in generate_list(1, 12, 14 / 11)] # MRFA-D
+    attention_distances = [generate_list(1, 12, 14 / 11)] * 12 # MRF-W
+    model_kwargs = dict(patch_size=2, embed_dim=768, depth=12, num_heads=12, attention_distances=attention_distances, **kwargs)
     model = _create_vision_transformer('vitp_base_patch2_32', pretrained=pretrained, **model_kwargs)
     return model
 
+########  CIFAR MODEL END  ########
 
-def vitp_large_patch2_32(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 15, 15 / 15)] * 12
-    model_kwargs = dict(patch_size=2, embed_dim=480, depth=12, num_heads=15, attention_distance=attention_distance, **kwargs)
-    model = _create_vision_transformer('vitp_large_patch2_32', pretrained=pretrained, **model_kwargs)
-    return model
 
+######## IMAGENET MODEL START ########
 
 def vitp_tiny_patch16_224(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 3, 6)] * 12
-    model_kwargs = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3, attention_distance=attention_distance, **kwargs)
+    attention_distances = [generate_list(1, 3, 12 / 2)] * 12  # [1, 7, 13]
+    model_kwargs = dict(
+        patch_size=16, embed_dim=192, depth=12, num_heads=3,
+        attention_distances=attention_distances, attention_bias_decay_scale=1/5.12, # 390 / 312 / 16 * 2.5
+        **kwargs)
     model = _create_vision_transformer('vitp_tiny_patch16_224', pretrained=pretrained, **model_kwargs)
     return model
 
 
 def vitp_small_patch16_224(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 6, 13 / 12)] * 12
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, attention_distance=attention_distance, **kwargs)
+    attention_distances = [generate_list(1, 6, 12 / 5)] * 12
+    model_kwargs = dict(
+        patch_size=16, embed_dim=384, depth=12, num_heads=6,
+        attention_distances=attention_distances, attention_bias_decay_scale=1/5.12,
+        **kwargs)
     model = _create_vision_transformer('vitp_small_patch16_224', pretrained=pretrained, **model_kwargs)
     return model
 
 
 def vitp_base_patch16_224(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 12, 13 / 12)] * 12
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, attention_distance=attention_distance, **kwargs)
+    attention_distances = [generate_list(1, 12, 12 / 11)] * 12
+    model_kwargs = dict(
+        patch_size=16, embed_dim=768, depth=12, num_heads=12, 
+        attention_distances=attention_distances, attention_bias_decay_scale=1/5.12,
+        **kwargs)
     model = _create_vision_transformer('vitp_base_patch16_224', pretrained=pretrained, **model_kwargs)
     return model
 
-
-@register_model
-def vitp_large_patch16_224(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 13, 13 / 13)] * 24
-    model_kwargs = dict(patch_size=16, embed_dim=416, depth=24, num_heads=13, attention_distance=attention_distance, **kwargs)
-    model = _create_vision_transformer('vitp_large_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
+########  IMAGENET MODEL END  ########

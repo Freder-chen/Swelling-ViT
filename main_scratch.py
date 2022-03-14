@@ -7,6 +7,7 @@
 # References:
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
+# MAE: https://github.com/facebookresearch/mae
 # --------------------------------------------------------
 
 import os
@@ -25,6 +26,8 @@ import timm
 from timm.data.mixup import Mixup
 from timm.models.layers import trunc_normal_
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+
+import models
 
 import util.misc as misc
 import util.lr_decay as lrd
@@ -118,7 +121,7 @@ def get_args_parser():
                         help='Use class token instead of global pool for classification')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    parser.add_argument('--data_path', default='/datasets/', type=str,
                         help='dataset path')
     parser.add_argument('--dataset', default='imagenet', type=str,
                         help='dataset name (imagenet, cifar10, cifar100)') 
@@ -226,20 +229,25 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
     
     # Load model
-    try:
-        from models import vit
-        model = vit.__dict__[args.model](
-            num_classes=args.nb_classes,
-            drop_path_rate=args.drop_path,
-            global_pool=args.global_pool,
-        )
-    except:
-        from models import vitp
-        model = vitp.__dict__[args.model](
-            num_classes=args.nb_classes,
-            drop_path_rate=args.drop_path,
-            global_pool=args.global_pool,
-        )
+    model = models.__dict__[args.model](
+        num_classes=args.nb_classes,
+        drop_path_rate=args.drop_path,
+        global_pool=args.global_pool,
+    )
+    # try:
+    #     from models import vit
+    #     model = vit.__dict__[args.model](
+    #         num_classes=args.nb_classes,
+    #         drop_path_rate=args.drop_path,
+    #         global_pool=args.global_pool,
+    #     )
+    # except:
+    #     from models import vitp
+    #     model = vitp.__dict__[args.model](
+    #         num_classes=args.nb_classes,
+    #         drop_path_rate=args.drop_path,
+    #         global_pool=args.global_pool,
+    #     )
 
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu')

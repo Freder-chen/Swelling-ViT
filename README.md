@@ -2,6 +2,13 @@
 
 This is a PyTorch/GPU re-implementation of the paper: [ViT-P: Rethinking Data-efficient Vision Transformers from Locality](https://arxiv.org/abs/2203.02358).
 
+## Install
+
+``` shell
+pip intall torch torchvision tensorboard
+pip install timm==0.4.12
+```
+
 ## TODO
 
 - [ ] run script
@@ -59,5 +66,3 @@ python3 -m torch.distributed.launch --nproc_per_node=1 main_scratch.py \
     --global_pool --mean 0.5070 0.4865 0.4409 --std 0.2673 0.2564 0.2761 \
 > info.log 2>&1 &
 ```
-
-

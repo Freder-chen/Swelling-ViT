@@ -22,6 +22,14 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 
 
+def adjust_mask_ratio(epochs, epoch, early_off=50):
+    """
+    epoch: [0, epochs)
+    """
+    ratio = (epochs - epoch - early_off) / (epochs - early_off)
+    return ratio if ratio > 0 else 0
+    
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
@@ -30,9 +38,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('mask', misc.SmoothedValue(window_size=1, fmt='{value:.3f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 50
 
+    mask_ratio = adjust_mask_ratio(args.epochs, epoch) # init mask ratio
     accum_iter = args.accum_iter
 
     optimizer.zero_grad()
@@ -41,10 +51,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+            mask_ratio = adjust_mask_ratio(args.epochs, epoch + data_iter_step / len(data_loader))
 
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -53,7 +63,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             samples, targets = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast():
-            outputs = model(samples)
+            outputs = model(samples, mask_ratio=mask_ratio)
             loss = criterion(outputs, targets)
 
         loss_value = loss.item()
@@ -72,12 +82,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
-        min_lr = 10.
-        max_lr = 0.
+        metric_logger.update(mask=mask_ratio)
+        min_lr, max_lr = 10., 0.
         for group in optimizer.param_groups:
             min_lr = min(min_lr, group["lr"])
             max_lr = max(max_lr, group["lr"])
-
         metric_logger.update(lr=max_lr)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)

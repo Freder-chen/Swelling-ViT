@@ -1,6 +1,16 @@
-# ViT-P PyTorch implementation
+# Swelling-ViT PyTorch implementation
 
 This is a PyTorch/GPU re-implementation of the paper: [ViT-P: Rethinking Data-efficient Vision Transformers from Locality](https://arxiv.org/abs/2203.02358).
+
+## Performance
+
+| Model                                                        | Params    |  Cifar10  | Cifar100  |
+| ------------------------------------------------------------ | :-------- | :-------: | :-------: |
+| ViT-Base(copy from [NesT](https://arxiv.org/pdf/2105.12723.pdf)) | 85.3M     |   92.41   |   70.49   |
+| ViT-Base(ours)                                               | 85.3M     |   96.92   |   80.57   |
+| **SwellingViT-Tiny**                                         | **5.4M**  | **95.91** | **78.85** |
+| **SwellingViT-Small**                                        | **21.5M** | **96.98** | **81.96** |
+| **SwellingViT-Base**                                         | **85.3M** | **97.29** | **82.60** |
 
 ## Install
 
@@ -8,11 +18,6 @@ This is a PyTorch/GPU re-implementation of the paper: [ViT-P: Rethinking Data-ef
 pip intall torch torchvision tensorboard
 pip install timm==0.4.12
 ```
-
-## TODO
-
-- [ ] run script
-- [ ] model weights
 
 ## Usage
 
@@ -24,7 +29,7 @@ nohup \
 python3 -m torch.distributed.launch --nproc_per_node=1 main_scratch.py \
     --accum_iter 1 --batch_size 256 \
     --num_workers 8 \
-    --model vitp_tiny_patch2_32 --input_size 32 \
+    --model swelling_vit_tiny_patch2_32 --input_size 32 \
     --epochs 300 --blr 5e-4 --layer_decay 1.0 \
     --warmup_epochs 20 --weight_decay 0.3 --drop_path 0.1 --opt_betas 0.9 0.95 \
     --mixup 0.8 --cutmix 1.0 --reprob 0.25 --color_jitter 0.4 \
@@ -40,7 +45,7 @@ nohup \
 python3 -m torch.distributed.launch --nproc_per_node=8 main_scratch.py \
     --accum_iter 1 --batch_size 512 \
     --num_workers 8 \
-    --model vitp_tiny_patch16_224 --input_size 224 \
+    --model swelling_vit_tiny_patch16_224 --input_size 224 \
     --epochs 300 --blr 1e-4 --layer_decay 1.0 \
     --warmup_epochs 20 --weight_decay 0.3 --drop_path 0.1 --opt_betas 0.9 0.95 \
     --mixup 0.8 --cutmix 1.0 --reprob 0.25 --color_jitter 0.4 \
@@ -66,3 +71,8 @@ python3 -m torch.distributed.launch --nproc_per_node=1 main_scratch.py \
     --global_pool --mean 0.5070 0.4865 0.4409 --std 0.2673 0.2564 0.2761 \
 > info.log 2>&1 &
 ```
+
+## TODO
+
+- [ ] model weights
+- [ ] multi-stage models

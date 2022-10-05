@@ -47,10 +47,6 @@ def _cfg(url='', **kwargs):
     }
 
 
-def generate_list(start, num=12, step=0):
-    return [start + i * step for i in range(num)]
-
-
 default_cfgs = {
     'swelling_vit_tiny_patch2_32': _cfg(url='', input_size=(3, 32, 32)),
     'swelling_vit_small_patch2_32': _cfg(url='', input_size=(3, 32, 32)),
@@ -61,12 +57,19 @@ default_cfgs = {
 }
 
 
-def gaussian1d(l, i=0, sigma=1):
-    m = np.ogrid[-l : l]
-    h = np.exp(-(m * m) / (2 * sigma * sigma))
-    h[h < np.finfo(h.dtype).eps * h.max()] = 0
-    s = int(l - i)
-    return h[s : s + l]
+def generate_list(start, num=12, step=0):
+    return [start + i * step for i in range(num)]
+
+
+def _ntuple(n):
+    def parse(x):
+        if isinstance(x, collections.abc.Iterable):
+            return x
+        return tuple(repeat(x, n))
+    return parse
+
+to_2tuple = _ntuple(2)
+to_ntuple = _ntuple
 
 
 class SwellAttention(nn.Module):
@@ -79,12 +82,7 @@ class SwellAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
-        if isinstance(att_distance, int):
-            att_distance = [att_distance] * num_heads
-        elif isinstance(att_distance, list) and len(att_distance) == num_heads:
-            pass
-        else:
-            raise ValueError('attention_distance type illegal. {}'.format(att_distance))
+        att_distance = to_ntuple(num_heads)(att_distance)
         
         self.attention_distance = att_distance
         self.num_patches = num_patches
@@ -219,7 +217,6 @@ class VisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim), requires_grad=True)
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim), requires_grad=False)
         self.pos_drop = nn.Dropout(p=drop_rate)
  
@@ -537,20 +534,10 @@ def swelling_vit_base_patch16_224(pretrained=False, **kwargs):
     return model
 
 
-def swelling_vit_large_patch16_224(pretrained=False, **kwargs):
-    attention_distance = [generate_list(1, 16, 0)] * 24
-    model_kwargs = dict(
-        patch_size=16, embed_dim=1024//2, depth=24, num_heads=16,
-        attention_distance=attention_distance, **kwargs)
-    model = _create_vision_transformer('swelling_vit_large_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-
 # def swelling_vit_large_patch16_224(pretrained=False, **kwargs):
-#     attention_distance = [generate_list(1, 13, 12 / 12)] * 24
+#     attention_distance = [generate_list(1, 16, 0)] * 24
 #     model_kwargs = dict(
-#         patch_size=16, embed_dim=832, depth=24, num_heads=13,
-#         attention_distance=attention_distance, position_decay_scale=1/5.12,
-#         **kwargs)
+#         patch_size=16, embed_dim=1024, depth=24, num_heads=16,
+#         attention_distance=attention_distance, **kwargs)
 #     model = _create_vision_transformer('swelling_vit_large_patch16_224', pretrained=pretrained, **model_kwargs)
 #     return model

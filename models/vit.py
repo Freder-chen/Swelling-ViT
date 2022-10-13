@@ -64,6 +64,14 @@ def vit_tiny_patch2(**kwargs):
         qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
+
+def vit_small_patch2(**kwargs):
+    model = VisionTransformer(
+        img_size=32, patch_size=2, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4,
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+
 def vit_base_patch2(**kwargs):
     model = VisionTransformer(
         img_size=32, patch_size=2, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,

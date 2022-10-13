@@ -236,20 +236,6 @@ def main(args):
         drop_path_rate=args.drop_path,
         global_pool=args.global_pool,
     )
-    # try:
-    #     from models import vit
-    #     model = vit.__dict__[args.model](
-    #         num_classes=args.nb_classes,
-    #         drop_path_rate=args.drop_path,
-    #         global_pool=args.global_pool,
-    #     )
-    # except:
-    #     from models import vitp
-    #     model = vitp.__dict__[args.model](
-    #         num_classes=args.nb_classes,
-    #         drop_path_rate=args.drop_path,
-    #         global_pool=args.global_pool,
-    #     )
 
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu')
